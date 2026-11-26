@@ -2,65 +2,66 @@ name: Build Xray LuCI
 
 on:
   push:
-    tags:
-      - "*"
+    tags: ["*"]
   workflow_dispatch:
 
 env:
   PACKAGE_NAME: luci-app-xray
+  SDK_URL: https://downloads.openwrt.org/releases/25.12.2/targets/mediatek/filogic
+  SDK_PATTERN: openwrt-sdk-25.12.2-mediatek-filogic
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build aarch64_cortex-a53
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - id: "25.12"
-            arch: aarch64_cortex-a53
-            sdk_url: https://downloads.openwrt.org/releases/25.12.2/targets/mediatek/filogic
-            sdk_name: -sdk-25.12.2-mediatek-filogic_
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Cache SDK and feeds
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/sdk-cache
-            ~/.ccache
-          key: openwrt-sdk-${{ matrix.arch }}-${{ github.run_id }}
-          restore-keys: |
-            openwrt-sdk-${{ matrix.arch }}-
-
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache gettext libncurses5-dev xsltproc zstd
+          sudo apt-get install -y ccache gettext libncurses5-dev xsltproc zstd wget
 
-      - name: Download SDK
+      - name: Download and extract SDK
         run: |
-          mkdir -p ~/sdk-cache
-          cd ~/sdk-cache
-          FILE=$(curl -s "${{ matrix.sdk_url }}/sha256sums" | grep "${{ matrix.sdk_name }}" | cut -d' ' -f2 | sed 's/*//g')
-          echo "SDK: $FILE"
-          if [ ! -f "$FILE" ]; then
-            wget -q "${{ matrix.sdk_url }}/$FILE"
+          set -euo pipefail
+          mkdir -p $HOME/sdk-cache $HOME/sdk
+          cd $HOME/sdk-cache
+
+          echo "=== 获取 sha256sums ==="
+          curl -fsSL "$SDK_URL/sha256sums" -o sha256sums
+          echo "--- 匹配行 ---"
+          grep "$SDK_PATTERN" sha256sums || { echo "::error::SDK_PATTERN 未匹配"; exit 1; }
+
+          SDK_FILE=$(grep "$SDK_PATTERN" sha256sums | head -1 | awk '{print $2}' | sed 's/^\*//')
+          if [ -z "$SDK_FILE" ]; then
+            echo "::error::SDK_FILE 为空"
+            exit 1
           fi
-          echo "SDK_FILE=$FILE" >> $GITHUB_ENV
+          echo "SDK_FILE=$SDK_FILE"
 
-      - name: Extract SDK
-        run: |
-          mkdir -p $HOME/sdk
-          tar -C $HOME/sdk --strip=1 -I zstd -xf ~/sdk-cache/${{ env.SDK_FILE }}
-          echo "SDK_HOME=$HOME/sdk" >> $GITHUB_ENV
+          if [ ! -s "$SDK_FILE" ]; then
+            echo "=== 下载 ==="
+            wget -q --show-progress "$SDK_URL/$SDK_FILE"
+          fi
+
+          ls -lh "$SDK_FILE"
+          echo "=== 校验 ==="
+          grep "$SDK_PATTERN" sha256sums > check.txt
+          cat check.txt
+          sha256sum -c check.txt
+
+          echo "=== 解压 ==="
+          tar -C $HOME/sdk --strip=1 -I zstd -xvf "$SDK_FILE"
+          echo "=== 解压结果 ==="
+          ls $HOME/sdk | head -20
 
       - name: Setup feeds
         run: |
-          cd $SDK_HOME
+          set -euo pipefail
+          cd $HOME/sdk
           cp feeds.conf.default feeds.conf
           sed -i 's#git.openwrt.org/openwrt/openwrt#github.com/openwrt/openwrt#' feeds.conf
           sed -i 's#git.openwrt.org/feed/packages#github.com/openwrt/packages#' feeds.conf
@@ -70,34 +71,35 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Link package source
+      - name: Link source and configure
         run: |
-          cd $SDK_HOME
+          set -euo pipefail
+          cd $HOME/sdk
           ln -sfn $GITHUB_WORKSPACE package/luci-app-xray
-
-      - name: Configure
-        run: |
-          cd $SDK_HOME
           echo "CONFIG_PACKAGE_luci-app-xray=y" >> .config
           make defconfig
+          grep -i xray .config || true
 
       - name: Build
         run: |
-          cd $SDK_HOME
+          set -euo pipefail
+          cd $HOME/sdk
           make package/luci-app-xray/compile -j$(nproc) V=s
 
-      - name: Collect artifacts
+      - name: Collect
         run: |
+          set -euo pipefail
           mkdir -p $GITHUB_WORKSPACE/out
-          find $SDK_HOME/bin -type f \( -name "*${PACKAGE_NAME}*.apk" -o -name "*${PACKAGE_NAME}*.ipk" \) \
-            -exec cp {} $GITHUB_WORKSPACE/out/ \;
+          find $HOME/sdk/bin -type f \( -name "*luci-app-xray*.apk" -o -name "*luci-app-xray*.ipk" \) \
+            -exec cp -v {} $GITHUB_WORKSPACE/out/ \;
           echo "=== 产物 ==="
           ls -lh $GITHUB_WORKSPACE/out/
+          [ "$(ls -A $GITHUB_WORKSPACE/out)" ] || { echo "::error::没有产物"; exit 1; }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: luci-app-xray-${{ matrix.arch }}
+          name: luci-app-xray-aarch64_cortex-a53
           path: $GITHUB_WORKSPACE/out/*
           if-no-files-found: error
           retention-days: 30
