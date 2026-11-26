@@ -1,4 +1,4 @@
-name: Build and Release
+name: Build Xray LuCI
 
 on:
   push:
@@ -8,119 +8,96 @@ on:
 
 env:
   PACKAGE_NAME: luci-app-xray
-  CACHE_DIR: ~/cache
 
 jobs:
-  release:
-    name: Build for ${{ matrix.arch }} (${{ matrix.id }})
+  build:
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - id: 25.12
+          - id: "25.12"
             arch: aarch64_cortex-a53
-            sdk_url_path: https://downloads.openwrt.org/releases/25.12.2/targets/mediatek/filogic
+            sdk_url: https://downloads.openwrt.org/releases/25.12.2/targets/mediatek/filogic
             sdk_name: -sdk-25.12.2-mediatek-filogic_
-    env:
-      SDK_URL_PATH: ${{ matrix.sdk_url_path }}
-      SDK_NAME: ${{ matrix.sdk_name }}
-      CCACHE_DIR: ~/.ccache
-      CONFIG_CCACHE: y
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Prepare Cache Key
-        id: cache_key
-        run: echo "timestamp=$(date +%s)" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Cache
+      - name: Cache SDK and feeds
         uses: actions/cache@v4
         with:
           path: |
-            ${{ env.CACHE_DIR }}
-            ${{ env.CCACHE_DIR }}
-          key: openwrt-${{ matrix.arch }}-${{ matrix.id }}-${{ env.PACKAGE_NAME }}-${{ steps.cache_key.outputs.timestamp }}
+            ~/sdk-cache
+            ~/.ccache
+          key: openwrt-sdk-${{ matrix.arch }}-${{ github.run_id }}
           restore-keys: |
-            openwrt-${{ matrix.arch }}-${{ matrix.id }}-${{ env.PACKAGE_NAME }}-
+            openwrt-sdk-${{ matrix.arch }}-
 
-      - name: Install Dependencies
+      - name: Install deps
         run: |
-          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y ccache gettext libncurses5-dev xsltproc zstd
+          sudo apt-get update
+          sudo apt-get install -y ccache gettext libncurses5-dev xsltproc zstd
 
-      - name: Create Directories
+      - name: Download SDK
         run: |
-          CACHE_DIR_SDK="$(eval echo "$CACHE_DIR/sdk")"
-          CACHE_DIR_DL="$(eval echo "$CACHE_DIR/dl")"
-          CACHE_DIR_FEEDS="$(eval echo "$CACHE_DIR/feeds")"
-          test -d "$CACHE_DIR_SDK" || mkdir -p "$CACHE_DIR_SDK"
-          test -d "$CACHE_DIR_DL" || mkdir -p "$CACHE_DIR_DL"
-          test -d "$CACHE_DIR_FEEDS" || mkdir -p "$CACHE_DIR_FEEDS"
-          echo "CACHE_DIR_SDK=$CACHE_DIR_SDK" >> $GITHUB_ENV
-          echo "CACHE_DIR_DL=$CACHE_DIR_DL" >> $GITHUB_ENV
-          echo "CACHE_DIR_FEEDS=$CACHE_DIR_FEEDS" >> $GITHUB_ENV
-          echo "SDK_HOME=$(mktemp -d)" >> $GITHUB_ENV
-
-      - name: Download and Unzip SDK
-        run: |
-          cd "$CACHE_DIR_SDK"
-          if ! ( wget -q -O - "$SDK_URL_PATH/sha256sums" | grep -- "$SDK_NAME" > sha256sums.small 2>/dev/null ) ; then
-            echo "::error::Can not find ${SDK_NAME} file in sha256sums."
-            exit 1
+          mkdir -p ~/sdk-cache
+          cd ~/sdk-cache
+          FILE=$(curl -s "${{ matrix.sdk_url }}/sha256sums" | grep "${{ matrix.sdk_name }}" | cut -d' ' -f2 | sed 's/*//g')
+          echo "SDK: $FILE"
+          if [ ! -f "$FILE" ]; then
+            wget -q "${{ matrix.sdk_url }}/$FILE"
           fi
-          SDK_FILE="$(cat sha256sums.small | cut -d' ' -f2 | sed 's/*//g')"
-          if ! sha256sum -c ./sha256sums.small >/dev/null 2>&1 ; then
-            wget -q -O "$SDK_FILE" "$SDK_URL_PATH/$SDK_FILE"
-            if ! sha256sum -c ./sha256sums.small >/dev/null 2>&1 ; then
-              echo "::error::SDK can not be verified!"
-              exit 1
-            fi
-          fi
-          cd -
-          file "$CACHE_DIR_SDK/$SDK_FILE"
-          tar -C "$SDK_HOME" --strip=1 -xf "$CACHE_DIR_SDK/$SDK_FILE"
-          cd "$SDK_HOME"
-          test -d "dl" && rm -rf "dl" || true
-          test -d "feeds" && rm -rf "feeds" || true
-          ln -s "$CACHE_DIR_DL" "dl"
-          ln -s "$CACHE_DIR_FEEDS" "feeds"
+          echo "SDK_FILE=$FILE" >> $GITHUB_ENV
+
+      - name: Extract SDK
+        run: |
+          mkdir -p $HOME/sdk
+          tar -C $HOME/sdk --strip=1 -I zstd -xf ~/sdk-cache/${{ env.SDK_FILE }}
+          echo "SDK_HOME=$HOME/sdk" >> $GITHUB_ENV
+
+      - name: Setup feeds
+        run: |
+          cd $SDK_HOME
           cp feeds.conf.default feeds.conf
           sed -i 's#git.openwrt.org/openwrt/openwrt#github.com/openwrt/openwrt#' feeds.conf
           sed -i 's#git.openwrt.org/feed/packages#github.com/openwrt/packages#' feeds.conf
           sed -i 's#git.openwrt.org/project/luci#github.com/openwrt/luci#' feeds.conf
+          sed -i 's#git.openwrt.org/feed/routing#github.com/openwrt/routing#' feeds.conf
           sed -i 's#git.openwrt.org/feed/telephony#github.com/openwrt/telephony#' feeds.conf
-          cd -
-
-      - name: Update and Install Packages
-        run: |
-          cd "$SDK_HOME"
           ./scripts/feeds update -a
-          ln -s "${{ github.workspace }}" "package/$PACKAGE_NAME"
           ./scripts/feeds install -a
-          cd -
 
-      - name: Build Packages
+      - name: Link package source
         run: |
-          cd "$SDK_HOME"
+          cd $SDK_HOME
+          ln -sfn $GITHUB_WORKSPACE package/luci-app-xray
+
+      - name: Configure
+        run: |
+          cd $SDK_HOME
+          echo "CONFIG_PACKAGE_luci-app-xray=y" >> .config
           make defconfig
-          make package/${PACKAGE_NAME}/status/{clean,compile} V=s
-          find "$SDK_HOME/bin/" -type f \( -name "*.ipk" -o -name "*.apk" \) -exec ls -lh {} \;
-          cd -
 
-      - name: Copy Bin Files
+      - name: Build
         run: |
-          find "$SDK_HOME/bin/" -type f \( -name "${PACKAGE_NAME}*.ipk" -o -name "${PACKAGE_NAME}*.apk" \) | while read -r f; do
-            base="$(basename "$f")"
-            cp "$f" "${{ github.workspace }}/${base%.*}-${{ matrix.arch }}.${base##*.}"
-          done
-          find "${{ github.workspace }}" -maxdepth 1 -type f \( -name "*.ipk" -o -name "*.apk" \) -exec ls -lh {} \;
+          cd $SDK_HOME
+          make package/luci-app-xray/compile -j$(nproc) V=s
 
-      - name: Release and Upload Assets
-        uses: softprops/action-gh-release@v1
+      - name: Collect artifacts
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/out
+          find $SDK_HOME/bin -type f \( -name "*${PACKAGE_NAME}*.apk" -o -name "*${PACKAGE_NAME}*.ipk" \) \
+            -exec cp {} $GITHUB_WORKSPACE/out/ \;
+          echo "=== 产物 ==="
+          ls -lh $GITHUB_WORKSPACE/out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            *.ipk
-            *.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: luci-app-xray-${{ matrix.arch }}
+          path: $GITHUB_WORKSPACE/out/*
+          if-no-files-found: error
+          retention-days: 30
